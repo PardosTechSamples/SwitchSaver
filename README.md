@@ -18,3 +18,8 @@ This project is distributed under the Public License. For more information, see 
 
 # Contact
 Interested in collaborating or have questions about the project? Reach out via email at admin@pardostech.com.
+
+
+# Compilation:
+
+pyinstaller --onefile --noconsole SwitchSaver.py
