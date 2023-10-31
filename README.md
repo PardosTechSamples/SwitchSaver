@@ -1,5 +1,4 @@
 # Switch Saver
-Description
 Switch Saver is a Windows executable designed to assist administrators in setting and retrieving configurations on Cisco switches. The tool simplifies the process, making it more efficient and user-friendly.
 # Features
 Set Configurations: Easily set configurations for your Cisco switches.
