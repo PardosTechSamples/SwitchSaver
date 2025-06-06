@@ -8,6 +8,7 @@ import threading
 import queue  # Used for thread-safe communication with the GUI
 import time
 import base64  # NEW: Needed for host key fingerprinting
+import socket
 
 
 # NEW: Custom host key policy to interact with the GUI
@@ -92,6 +93,13 @@ class SwitchSaverApp:
                    command=lambda: self._generate_csv_from_folder(self.extract_serial_info, "Serial Number")).pack(
             pady=15, fill=tk.X)
 
+        # Add a small spacer
+        ttk.Label(menu_frame, text="").pack(pady=5)  # Adds a bit of vertical space
+        # Add the author label
+        author_label = ttk.Label(menu_frame, text="Created by: Cristian Pardo Pardostech.com", font=("Helvetica", 10, "italic"))
+        author_label.pack(pady=(10, 0), fill=tk.X)  # pady=(top, bottom)
+        # --- END OF NAME ADDITION ---
+
     def run_ssh_bot_ui(self):
         # Clear any existing widgets
         for widget in self.root.winfo_children():
@@ -104,50 +112,82 @@ class SwitchSaverApp:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
 
-        # --- UI Elements ---
-        self.file_label = ttk.Label(ssh_frame, text="No IP file chosen")
-        ttk.Button(ssh_frame, text="Choose IP Address File", command=self._open_file).grid(row=0, column=0, padx=5,
-                                                                                           pady=5, sticky=tk.W)
-        self.file_label.grid(row=0, column=1, columnspan=2, padx=5, pady=5, sticky=tk.W)
+        # --- IP Input Method Selection ---
+        self.ip_input_method = tk.StringVar(value="file")
+        ip_method_frame = ttk.LabelFrame(ssh_frame, text="IP Input Method", padding="5")
+        ip_method_frame.grid(row=0, column=0, columnspan=3, padx=5, pady=5, sticky=(tk.W, tk.E))
+        
+        ttk.Radiobutton(ip_method_frame, text="IP File", variable=self.ip_input_method, 
+                       value="file", command=self._toggle_ip_input).pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(ip_method_frame, text="Single IP", variable=self.ip_input_method,
+                       value="single", command=self._toggle_ip_input).pack(side=tk.LEFT, padx=5)
 
+        # --- File Input Frame ---
+        self.file_frame = ttk.Frame(ssh_frame)
+        self.file_frame.grid(row=1, column=0, columnspan=3, sticky=(tk.W, tk.E))
+        
+        self.file_label = ttk.Label(self.file_frame, text="No IP file chosen")
+        ttk.Button(self.file_frame, text="Choose IP Address File", command=self._open_file).pack(side=tk.LEFT, padx=5, pady=5)
+        self.file_label.pack(side=tk.LEFT, padx=5, pady=5)
+
+        # --- Single IP Input Frame ---
+        self.single_ip_frame = ttk.Frame(ssh_frame)
+        self.single_ip_frame.grid(row=1, column=0, columnspan=3, sticky=(tk.W, tk.E))
+        self.single_ip_frame.grid_remove()  # Initially hidden
+        
+        ttk.Label(self.single_ip_frame, text="IP Address:").pack(side=tk.LEFT, padx=5, pady=5)
+        self.single_ip_entry = ttk.Entry(self.single_ip_frame, width=20)
+        self.single_ip_entry.pack(side=tk.LEFT, padx=5, pady=5)
+
+        # --- Rest of the UI Elements ---
         self.output_folder_entry = ttk.Entry(ssh_frame, textvariable=self.output_directory, width=40)
-        ttk.Button(ssh_frame, text="Choose Output Folder", command=self._choose_output_folder).grid(row=1, column=0,
+        ttk.Button(ssh_frame, text="Choose Output Folder", command=self._choose_output_folder).grid(row=2, column=0,
                                                                                                     padx=5, pady=5,
                                                                                                     sticky=tk.W)
-        self.output_folder_entry.grid(row=1, column=1, columnspan=2, padx=5, pady=5, sticky=(tk.W, tk.E))
+        self.output_folder_entry.grid(row=2, column=1, columnspan=2, padx=5, pady=5, sticky=(tk.W, tk.E))
 
         self.user_entry = ttk.Entry(ssh_frame)
         self.password_entry = ttk.Entry(ssh_frame, show="*")
-        ttk.Label(ssh_frame, text="Username:").grid(row=2, column=0, padx=5, pady=5, sticky=tk.E)
-        self.user_entry.grid(row=2, column=1, padx=5, pady=5, sticky=(tk.W, tk.E))
-        ttk.Label(ssh_frame, text="Password:").grid(row=3, column=0, padx=5, pady=5, sticky=tk.E)
-        self.password_entry.grid(row=3, column=1, padx=5, pady=5, sticky=(tk.W, tk.E))
+        ttk.Label(ssh_frame, text="Username:").grid(row=3, column=0, padx=5, pady=5, sticky=tk.E)
+        self.user_entry.grid(row=3, column=1, padx=5, pady=5, sticky=(tk.W, tk.E))
+        ttk.Label(ssh_frame, text="Password:").grid(row=4, column=0, padx=5, pady=5, sticky=tk.E)
+        self.password_entry.grid(row=4, column=1, padx=5, pady=5, sticky=(tk.W, tk.E))
 
         command_options = ["show running-config", "show cdp neighbors detail", "show version", "Custom Command"]
         self.command_combobox = ttk.Combobox(ssh_frame, values=command_options, state="readonly")
         self.command_combobox.set(command_options[0])
         self.command_combobox.bind("<<ComboboxSelected>>", self._on_command_selected)
-        ttk.Label(ssh_frame, text="Command:").grid(row=4, column=0, padx=5, pady=5, sticky=tk.E)
-        self.command_combobox.grid(row=4, column=1, padx=5, pady=5, sticky=(tk.W, tk.E))
+        ttk.Label(ssh_frame, text="Command:").grid(row=5, column=0, padx=5, pady=5, sticky=tk.E)
+        self.command_combobox.grid(row=5, column=1, padx=5, pady=5, sticky=(tk.W, tk.E))
 
         self.custom_command_label = ttk.Label(ssh_frame, text="Custom Commands (one per line):")
         self.custom_command_text = tk.Text(ssh_frame, height=5, width=40)
 
         self.execute_button = ttk.Button(ssh_frame, text="Execute SSH", command=self._start_ssh_thread)
-        self.execute_button.grid(row=6, column=0, columnspan=2, pady=10)
+        self.execute_button.grid(row=7, column=0, columnspan=2, pady=10)
 
         self.notebook = ttk.Notebook(ssh_frame)
-        self.notebook.grid(row=7, column=0, columnspan=3, pady=5, padx=5, sticky='nsew')
-        ssh_frame.rowconfigure(7, weight=1)
+        self.notebook.grid(row=8, column=0, columnspan=3, pady=5, padx=5, sticky='nsew')
+        ssh_frame.rowconfigure(8, weight=1)
         ssh_frame.columnconfigure(1, weight=1)
 
         self.status_bar = ttk.Label(ssh_frame, text="Ready", relief=tk.SUNKEN, anchor=tk.W)
-        self.status_bar.grid(row=8, column=0, columnspan=3, sticky='ew')
+        self.status_bar.grid(row=9, column=0, columnspan=3, sticky='ew')
 
-        ttk.Button(ssh_frame, text="Return to Menu", command=self.main_menu).grid(row=9, column=0, columnspan=2,
+        ttk.Button(ssh_frame, text="Return to Menu", command=self.main_menu).grid(row=10, column=0, columnspan=2,
                                                                                   pady=10)
+        
+        # Initialize the IP input method
+        self._toggle_ip_input()
 
-    # --- Backend and Logic Methods (prefixed with _) ---
+    def _toggle_ip_input(self):
+        """Toggle between file input and single IP input frames."""
+        if self.ip_input_method.get() == "file":
+            self.file_frame.grid()
+            self.single_ip_frame.grid_remove()
+        else:
+            self.file_frame.grid_remove()
+            self.single_ip_frame.grid()
 
     def _open_file(self):
         self.file_path = filedialog.askopenfilename(title="Select IP Address File", filetypes=[("Text files", "*.txt")])
@@ -161,16 +201,27 @@ class SwitchSaverApp:
 
     def _on_command_selected(self, event=None):
         if self.command_combobox.get() == "Custom Command":
-            self.custom_command_label.grid(row=5, column=0, padx=5, pady=5, sticky=tk.W)
-            self.custom_command_text.grid(row=5, column=1, padx=5, pady=(5, 0), sticky=(tk.W, tk.E))
+            self.custom_command_label.grid(row=6, column=0, padx=5, pady=5, sticky=tk.W)
+            self.custom_command_text.grid(row=6, column=1, padx=5, pady=(5, 0), sticky=(tk.W, tk.E))
         else:
             self.custom_command_label.grid_forget()
             self.custom_command_text.grid_forget()
 
     def _start_ssh_thread(self):
-        if not self.file_path:
-            messagebox.showerror("Error", "Please choose an IP address file.")
-            return
+        if self.ip_input_method.get() == "file":
+            if not self.file_path:
+                messagebox.showerror("Error", "Please choose an IP address file.")
+                return
+        else:
+            ip = self.single_ip_entry.get().strip()
+            if not ip:
+                messagebox.showerror("Error", "Please enter an IP address.")
+                return
+            # Create a temporary file with the single IP
+            self.file_path = os.path.join(self.output_directory.get(), "temp_ip.txt")
+            with open(self.file_path, 'w') as f:
+                f.write(ip)
+
         if not self.user_entry.get() or not self.password_entry.get():
             messagebox.showerror("Error", "Please enter a username and password.")
             return
@@ -189,7 +240,7 @@ class SwitchSaverApp:
         self.thread.daemon = True
         self.thread.start()
 
-        self.root.after(100, self._process_queue)
+        self.root.after_idle(self._process_queue)
 
     def _ssh_worker(self):
         """This function runs in a separate thread to avoid freezing the GUI."""
@@ -215,15 +266,15 @@ class SwitchSaverApp:
                 ssh_client.set_missing_host_key_policy(gui_policy)
                 ssh_client.connect(ip, username=user, password=pwd, timeout=10, look_for_keys=False)
 
-                # ... (The rest of the SSH logic remains unchanged)
-
                 shell = ssh_client.invoke_shell()
+                shell.settimeout(6)  # Set a timeout for shell operations
                 aggregated_output = ""
                 self.q.put(('status', f"Setting terminal length on {ip}..."))
                 shell.send("terminal length 0\n")
                 time.sleep(0.5)
                 initial_buffer = ""
-                while True:
+                start_time = time.time()
+                while time.time() - start_time < 6:  # 6 second timeout for initial setup
                     if shell.recv_ready():
                         initial_buffer += shell.recv(65535).decode('utf-8', 'ignore')
                         if initial_buffer.strip().endswith(('#', '>')):
@@ -231,13 +282,19 @@ class SwitchSaverApp:
                     elif not shell.active:
                         raise paramiko.SSHException("Shell became inactive during initial setup.")
                     time.sleep(0.1)
+                else:
+                    raise paramiko.SSHException("Timeout waiting for initial prompt")
+
                 for cmd_index, current_cmd in enumerate(commands_to_run):
                     if not current_cmd.strip():
                         continue
                     self.q.put(('status', f"Executing on {ip}: {current_cmd[:30]}..."))
                     shell.send(current_cmd + "\n")
                     command_output_this_iteration = ""
-                    while True:
+                    start_time = time.time()
+                    is_reload_command = current_cmd.strip().lower() == "reload"
+                    
+                    while time.time() - start_time < 6:  # 6 second timeout per command
                         if shell.recv_ready():
                             chunk = shell.recv(65535).decode('utf-8', 'ignore')
                             command_output_this_iteration += chunk
@@ -251,9 +308,18 @@ class SwitchSaverApp:
                             self.q.put(('error', ip, f"Shell became inactive while executing: {current_cmd}"))
                             raise paramiko.SSHException("Shell inactive")
                         time.sleep(0.1)
+                    else:
+                        if is_reload_command:
+                            # For reload command, just log the timeout but continue
+                            self.q.put(('status', f"Device {ip} is reloading..."))
+                        else:
+                            self.q.put(('error', ip, f"Timeout executing command: {current_cmd}"))
+                            raise paramiko.SSHException(f"Timeout executing command: {current_cmd}")
+
                     aggregated_output += command_output_this_iteration
                     if cmd_index < len(commands_to_run) - 1 and len(commands_to_run) > 1:
                         aggregated_output += f"\n--- End of output for '{current_cmd}' ---\n\n"
+
                 final_output_for_ip = aggregated_output.strip()
                 filename_command_part = selected_command_option.replace(' ', '_').replace('/', '_')
                 filename = f"{ip}_{filename_command_part}.txt"
@@ -266,13 +332,17 @@ class SwitchSaverApp:
             except paramiko.AuthenticationException:
                 self.q.put(('error', ip, "Authentication failed. Please check credentials."))
             except paramiko.SSHException as e:
-                # MODIFIED: The error message now includes our custom rejection message.
                 self.q.put(('error', ip, f"SSH Error: {e}"))
+            except socket.timeout:
+                self.q.put(('error', ip, "Connection timed out. Please check network connectivity."))
             except Exception as e:
                 self.q.put(('error', ip, f"An error occurred with {ip}: {e}"))
             finally:
                 if ssh_client:
-                    ssh_client.close()
+                    try:
+                        ssh_client.close()
+                    except:
+                        pass
 
         self.q.put(('done', None))
 
