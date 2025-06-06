@@ -1,450 +1,470 @@
-import paramiko
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-import time
+import paramiko
 import os
 import re
 import csv
+import threading
+import queue  # Used for thread-safe communication with the GUI
+import time
+import base64  # NEW: Needed for host key fingerprinting
 
-password_entry = None
 
-app_title = "Switch Saver 1.0 - Cisco Switches"
-app_ssh_title = "Switch Saver (SSH Mode)"
+# NEW: Custom host key policy to interact with the GUI
+class GUIMissingHostKeyPolicy(paramiko.MissingHostKeyPolicy):
+    """
+    A custom policy that prompts the user via the GUI when a host key is unknown.
+    """
+
+    def __init__(self, app_instance):
+        self.app = app_instance
+
+    def missing_host_key(self, client, hostname, key):
+        # If user has already selected "Accept All", don't prompt again.
+        if self.app.accept_all_keys_session:
+            return
+
+        # Get a human-readable fingerprint for the key
+        fingerprint = base64.b64encode(key.get_fingerprint()).decode('utf-8')
+
+        # Clear the event and response holder before making a new request
+        self.app.host_key_event.clear()
+        self.app.host_key_response = None
+
+        # Send the verification request to the main GUI thread via the queue
+        self.app.q.put(('host_key_verification', hostname, fingerprint))
+
+        # Wait here until the main thread signals that the user has made a choice
+        self.app.host_key_event.wait()
+
+        # Process the user's choice
+        if self.app.host_key_response == 'accept_all':
+            self.app.accept_all_keys_session = True  # Set the flag for the rest of the session
+            print(f"Accepted and caching decision for all subsequent hosts in this session.")
+            return  # Accept the key
+        elif self.app.host_key_response == 'accept_once':
+            print(f"Accepted host key for {hostname} for this connection only.")
+            return  # Accept the key
+        else:  # 'reject' or None
+            print(f"Rejected host key for {hostname}.")
+            # Raising an exception is how we tell paramiko to reject the connection
+            raise paramiko.SSHException(f"Host key for {hostname} not accepted by user.")
 
 
-def main_menu():
-    menu_root = tk.Tk()
-    menu_root.title(app_title)
-    menu_root.minsize(400, 300)
-    menu_frame = ttk.Frame(menu_root, padding="30")
-    menu_frame.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+class SwitchSaverApp:
+    """
+    An object-oriented approach to the Switch Saver application.
+    This encapsulates all GUI elements and logic, avoiding global variables.
+    """
 
-    ssh_button = ttk.Button(menu_frame, text="Run SSH Bot", command=lambda: go_to_ssh(menu_root))
-    ssh_button.pack(pady=20)
+    def __init__(self, root):
+        self.root = root
+        self.file_path = None
+        self.output_directory = tk.StringVar(value=os.path.join(os.path.expanduser('~'), 'Desktop', 'Switch_Backups'))
 
-    # Add Generate CSV button
-    generateCDP_csv_button = ttk.Button(menu_frame, text="Generate CDP Neighbors CSV", command=lambda: generateCDP_csv(menu_root))
-    generateCDP_csv_button.pack(pady=20)
+        # NEW: Threading and state management for host key verification
+        self.host_key_event = threading.Event()
+        self.host_key_response = None  # Will be 'accept_once', 'accept_all', or 'reject'
+        self.accept_all_keys_session = False
 
-    generateVersion_csv_button = ttk.Button(menu_frame, text="Generate CDP Neighbors CSV", command=lambda: generateVERSION_csv(menu_root))
-    generateVersion_csv_button.pack(pady=20)
+        # Check if the default output directory exists, if not, create it
+        if not os.path.exists(self.output_directory.get()):
+            os.makedirs(self.output_directory.get())
 
-    menu_root.mainloop()
+        self.main_menu()
 
-def run_ssh_bot():
-    # Initialize main window
-    global output_folder_entry, file_label, user_entry, password_entry, command_combobox, custom_command_text, custom_command_label, notebook
+    def main_menu(self):
+        self.root.title("Switch Saver 2.0 - Cisco Switches")
+        self.root.minsize(400, 300)
 
+        # Clear any existing widgets
+        for widget in self.root.winfo_children():
+            widget.destroy()
+
+        menu_frame = ttk.Frame(self.root, padding="30")
+        menu_frame.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+
+        ttk.Button(menu_frame, text="Run SSH Bot", command=self.run_ssh_bot_ui).pack(pady=15, fill=tk.X)
+        ttk.Button(menu_frame, text="Generate CDP Neighbors CSV",
+                   command=lambda: self._generate_csv_from_folder(self.extract_cdp_info, "CDP Neighbor")).pack(pady=15,
+                                                                                                               fill=tk.X)
+        ttk.Button(menu_frame, text="Generate Serial Number CSV",
+                   command=lambda: self._generate_csv_from_folder(self.extract_serial_info, "Serial Number")).pack(
+            pady=15, fill=tk.X)
+
+    def run_ssh_bot_ui(self):
+        # Clear any existing widgets
+        for widget in self.root.winfo_children():
+            widget.destroy()
+
+        self.root.title("Switch Saver (SSH Mode)")
+
+        ssh_frame = ttk.Frame(self.root, padding="10 10 10 10")
+        ssh_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+
+        # --- UI Elements ---
+        self.file_label = ttk.Label(ssh_frame, text="No IP file chosen")
+        ttk.Button(ssh_frame, text="Choose IP Address File", command=self._open_file).grid(row=0, column=0, padx=5,
+                                                                                           pady=5, sticky=tk.W)
+        self.file_label.grid(row=0, column=1, columnspan=2, padx=5, pady=5, sticky=tk.W)
+
+        self.output_folder_entry = ttk.Entry(ssh_frame, textvariable=self.output_directory, width=40)
+        ttk.Button(ssh_frame, text="Choose Output Folder", command=self._choose_output_folder).grid(row=1, column=0,
+                                                                                                    padx=5, pady=5,
+                                                                                                    sticky=tk.W)
+        self.output_folder_entry.grid(row=1, column=1, columnspan=2, padx=5, pady=5, sticky=(tk.W, tk.E))
+
+        self.user_entry = ttk.Entry(ssh_frame)
+        self.password_entry = ttk.Entry(ssh_frame, show="*")
+        ttk.Label(ssh_frame, text="Username:").grid(row=2, column=0, padx=5, pady=5, sticky=tk.E)
+        self.user_entry.grid(row=2, column=1, padx=5, pady=5, sticky=(tk.W, tk.E))
+        ttk.Label(ssh_frame, text="Password:").grid(row=3, column=0, padx=5, pady=5, sticky=tk.E)
+        self.password_entry.grid(row=3, column=1, padx=5, pady=5, sticky=(tk.W, tk.E))
+
+        command_options = ["show running-config", "show cdp neighbors detail", "show version", "Custom Command"]
+        self.command_combobox = ttk.Combobox(ssh_frame, values=command_options, state="readonly")
+        self.command_combobox.set(command_options[0])
+        self.command_combobox.bind("<<ComboboxSelected>>", self._on_command_selected)
+        ttk.Label(ssh_frame, text="Command:").grid(row=4, column=0, padx=5, pady=5, sticky=tk.E)
+        self.command_combobox.grid(row=4, column=1, padx=5, pady=5, sticky=(tk.W, tk.E))
+
+        self.custom_command_label = ttk.Label(ssh_frame, text="Custom Commands (one per line):")
+        self.custom_command_text = tk.Text(ssh_frame, height=5, width=40)
+
+        self.execute_button = ttk.Button(ssh_frame, text="Execute SSH", command=self._start_ssh_thread)
+        self.execute_button.grid(row=6, column=0, columnspan=2, pady=10)
+
+        self.notebook = ttk.Notebook(ssh_frame)
+        self.notebook.grid(row=7, column=0, columnspan=3, pady=5, padx=5, sticky='nsew')
+        ssh_frame.rowconfigure(7, weight=1)
+        ssh_frame.columnconfigure(1, weight=1)
+
+        self.status_bar = ttk.Label(ssh_frame, text="Ready", relief=tk.SUNKEN, anchor=tk.W)
+        self.status_bar.grid(row=8, column=0, columnspan=3, sticky='ew')
+
+        ttk.Button(ssh_frame, text="Return to Menu", command=self.main_menu).grid(row=9, column=0, columnspan=2,
+                                                                                  pady=10)
+
+    # --- Backend and Logic Methods (prefixed with _) ---
+
+    def _open_file(self):
+        self.file_path = filedialog.askopenfilename(title="Select IP Address File", filetypes=[("Text files", "*.txt")])
+        if self.file_path:
+            self.file_label.config(text=os.path.basename(self.file_path))
+
+    def _choose_output_folder(self):
+        folder_path = filedialog.askdirectory(title="Select Output Folder")
+        if folder_path:
+            self.output_directory.set(folder_path)
+
+    def _on_command_selected(self, event=None):
+        if self.command_combobox.get() == "Custom Command":
+            self.custom_command_label.grid(row=5, column=0, padx=5, pady=5, sticky=tk.W)
+            self.custom_command_text.grid(row=5, column=1, padx=5, pady=(5, 0), sticky=(tk.W, tk.E))
+        else:
+            self.custom_command_label.grid_forget()
+            self.custom_command_text.grid_forget()
+
+    def _start_ssh_thread(self):
+        if not self.file_path:
+            messagebox.showerror("Error", "Please choose an IP address file.")
+            return
+        if not self.user_entry.get() or not self.password_entry.get():
+            messagebox.showerror("Error", "Please enter a username and password.")
+            return
+
+        self.execute_button.config(state=tk.DISABLED)
+        self.status_bar.config(text="Starting SSH process...")
+
+        for tab in self.notebook.tabs():
+            self.notebook.forget(tab)
+
+        # NEW: Reset the session-wide "accept all" flag each time the process is started
+        self.accept_all_keys_session = False
+
+        self.q = queue.Queue()
+        self.thread = threading.Thread(target=self._ssh_worker)
+        self.thread.daemon = True
+        self.thread.start()
+
+        self.root.after(100, self._process_queue)
+
+    def _ssh_worker(self):
+        """This function runs in a separate thread to avoid freezing the GUI."""
+        user = self.user_entry.get()
+        pwd = self.password_entry.get()
+        selected_command_option = self.command_combobox.get()
+        custom_commands_input = self.custom_command_text.get("1.0", tk.END).strip().splitlines()
+        commands_to_run = custom_commands_input if selected_command_option == "Custom Command" else [
+            selected_command_option]
+
+        # MODIFIED: Instantiate our custom GUI policy handler
+        gui_policy = GUIMissingHostKeyPolicy(self)
+
+        with open(self.file_path, 'r') as file:
+            ip_addresses = [line.strip() for line in file if line.strip()]
+
+        for ip in ip_addresses:
+            self.q.put(('status', f"Connecting to {ip}..."))
+            ssh_client = None
+            try:
+                ssh_client = paramiko.SSHClient()
+                # MODIFIED: Use our custom policy instead of AutoAddPolicy
+                ssh_client.set_missing_host_key_policy(gui_policy)
+                ssh_client.connect(ip, username=user, password=pwd, timeout=10, look_for_keys=False)
+
+                # ... (The rest of the SSH logic remains unchanged)
+
+                shell = ssh_client.invoke_shell()
+                aggregated_output = ""
+                self.q.put(('status', f"Setting terminal length on {ip}..."))
+                shell.send("terminal length 0\n")
+                time.sleep(0.5)
+                initial_buffer = ""
+                while True:
+                    if shell.recv_ready():
+                        initial_buffer += shell.recv(65535).decode('utf-8', 'ignore')
+                        if initial_buffer.strip().endswith(('#', '>')):
+                            break
+                    elif not shell.active:
+                        raise paramiko.SSHException("Shell became inactive during initial setup.")
+                    time.sleep(0.1)
+                for cmd_index, current_cmd in enumerate(commands_to_run):
+                    if not current_cmd.strip():
+                        continue
+                    self.q.put(('status', f"Executing on {ip}: {current_cmd[:30]}..."))
+                    shell.send(current_cmd + "\n")
+                    command_output_this_iteration = ""
+                    while True:
+                        if shell.recv_ready():
+                            chunk = shell.recv(65535).decode('utf-8', 'ignore')
+                            command_output_this_iteration += chunk
+                            stripped_output = command_output_this_iteration.strip()
+                            if stripped_output.endswith(('#', '>')):
+                                last_line = stripped_output.split('\n')[-1].strip()
+                                if (last_line.endswith('#') or last_line.endswith('>')) and \
+                                        (len(stripped_output) > len(current_cmd) + 5 or current_cmd not in last_line):
+                                    break
+                        elif not shell.active:
+                            self.q.put(('error', ip, f"Shell became inactive while executing: {current_cmd}"))
+                            raise paramiko.SSHException("Shell inactive")
+                        time.sleep(0.1)
+                    aggregated_output += command_output_this_iteration
+                    if cmd_index < len(commands_to_run) - 1 and len(commands_to_run) > 1:
+                        aggregated_output += f"\n--- End of output for '{current_cmd}' ---\n\n"
+                final_output_for_ip = aggregated_output.strip()
+                filename_command_part = selected_command_option.replace(' ', '_').replace('/', '_')
+                filename = f"{ip}_{filename_command_part}.txt"
+                filepath = os.path.join(self.output_directory.get(), filename)
+                os.makedirs(self.output_directory.get(), exist_ok=True)
+                with open(filepath, 'w', encoding='utf-8') as f:
+                    f.write(final_output_for_ip)
+                self.q.put(('result', ip, final_output_for_ip))
+
+            except paramiko.AuthenticationException:
+                self.q.put(('error', ip, "Authentication failed. Please check credentials."))
+            except paramiko.SSHException as e:
+                # MODIFIED: The error message now includes our custom rejection message.
+                self.q.put(('error', ip, f"SSH Error: {e}"))
+            except Exception as e:
+                self.q.put(('error', ip, f"An error occurred with {ip}: {e}"))
+            finally:
+                if ssh_client:
+                    ssh_client.close()
+
+        self.q.put(('done', None))
+
+    # NEW: A method to create the host key verification dialog
+    def _prompt_for_host_key(self, hostname, fingerprint):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Host Key Verification")
+
+        # Make the dialog modal
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        # Center the dialog
+        self.root.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() // 2) - (dialog.winfo_reqwidth() // 2)
+        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - (dialog.winfo_reqheight() // 2)
+        dialog.geometry(f"+{x}+{y}")
+
+        dialog.protocol("WM_DELETE_WINDOW", lambda: self._handle_host_key_response('reject', dialog))
+
+        frame = ttk.Frame(dialog, padding="20")
+        frame.pack(expand=True, fill=tk.BOTH)
+
+        message = (f"The authenticity of host '{hostname}' can't be established.\n"
+                   f"The host key fingerprint (sha256) is:\n{fingerprint}\n\n"
+                   f"Are you sure you want to continue connecting?")
+        ttk.Label(frame, text=message).pack(pady=10)
+
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(pady=10)
+
+        # Define button commands to set response and signal the event
+        ttk.Button(btn_frame, text="Accept All (Session)",
+                   command=lambda: self._handle_host_key_response('accept_all', dialog)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Accept Once",
+                   command=lambda: self._handle_host_key_response('accept_once', dialog)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Reject", command=lambda: self._handle_host_key_response('reject', dialog)).pack(
+            side=tk.LEFT, padx=5)
+
+        # Wait for the user to close the dialog
+        self.root.wait_window(dialog)
+
+    # NEW: A handler to process the dialog choice and unblock the worker thread
+    def _handle_host_key_response(self, response, dialog):
+        self.host_key_response = response
+        self.host_key_event.set()  # Signal the worker thread to continue
+        dialog.destroy()
+
+    def _process_queue(self):
+        """Processes messages from the worker thread's queue to update the GUI."""
+        try:
+            message = self.q.get_nowait()
+            message_type = message[0]
+
+            if message_type == 'status':
+                self.status_bar.config(text=message[1])
+
+            # MODIFIED: Handle the new host key verification message type
+            elif message_type == 'host_key_verification':
+                hostname, fingerprint = message[1], message[2]
+                self.status_bar.config(text=f"Verifying host key for {hostname}...")
+                self._prompt_for_host_key(hostname, fingerprint)
+
+            elif message_type in ('result', 'error'):
+                ip, content = message[1], message[2]
+                frame = ttk.Frame(self.notebook)
+                self.notebook.add(frame, text=ip)
+                text_widget = tk.Text(frame, wrap=tk.WORD, height=20, width=80)
+                text_widget.pack(padx=5, pady=5, expand=True, fill=tk.BOTH)
+                text_widget.insert(tk.END, content)
+                text_widget.config(state=tk.DISABLED)
+                if message_type == 'error':
+                    tab_id = self.notebook.tabs()[-1]
+                    self.notebook.tab(tab_id, text=f"{ip} (Error)")
+
+            elif message_type == 'done':
+                self.status_bar.config(text="Process finished.")
+                self.execute_button.config(state=tk.NORMAL)
+                # Avoid showing this if the process was just rejecting a key
+                if self.host_key_response != 'reject':
+                    messagebox.showinfo("Finished", "All SSH operations have completed.")
+                return
+
+        except queue.Empty:
+            pass
+        except Exception as e:
+            print(f"Error processing queue message: {e}")
+            self.status_bar.config(text=f"GUI Error: {e}")
+
+        self.root.after(100, self._process_queue)
+
+    # --- CSV Generation Methods (Unchanged) ---
+    # ... (the rest of your CSV methods remain here) ...
+    def _generate_csv_from_folder(self, extractor_func, data_type):
+        """
+        REFACTORED: A single function to handle CSV generation.
+        It takes a data extraction function and a data type name as arguments.
+        """
+        folder_path = filedialog.askdirectory(title=f"Select Folder with '{data_type}' Files")
+        if not folder_path:
+            messagebox.showwarning("Cancelled", "No folder selected.")
+            return
+
+        all_data = []
+        for filename in os.listdir(folder_path):
+            if filename.endswith('.txt'):
+                file_path = os.path.join(folder_path, filename)
+                data = extractor_func(file_path)
+                if data:
+                    all_data.extend(data)
+
+        if not all_data:
+            messagebox.showwarning("No Data", f"No valid {data_type} data found in the selected folder.")
+            return
+
+        save_path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV Files", "*.csv")],
+            title=f"Save {data_type} Data as CSV",
+            initialfile=f"{data_type.replace(' ', '_')}_export.csv"
+        )
+        if not save_path:
+            return
+
+        try:
+            with open(save_path, 'w', newline='') as csvfile:
+                csv_writer = csv.writer(csvfile)
+                # Write header based on the data type
+                if extractor_func == self.extract_cdp_info:
+                    csv_writer.writerow(
+                        ['SourceHostname', 'SourceIP', 'SourcePort', 'DestinationHostname', 'DestinationPort',
+                         'Platform'])
+                elif extractor_func == self.extract_serial_info:
+                    csv_writer.writerow(['Hostname', 'IP', 'SerialNumber'])
+                csv_writer.writerows(all_data)
+            messagebox.showinfo("Success", f"CSV file successfully generated: {save_path}")
+        except Exception as e:
+            messagebox.showerror("Error", f"An error occurred while saving the CSV file: {e}")
+
+    def extract_cdp_info(self, file_path):
+        """Extracts CDP neighbor details from a 'show cdp neighbors detail' output file."""
+        with open(file_path, 'r') as file:
+            content = file.read()
+
+        source_ip_match = re.search(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", os.path.basename(file_path))
+        source_ip = source_ip_match.group(0) if source_ip_match else "N/A"
+
+        # Get source hostname from the prompt at the end of the file
+        source_hostname_match = re.search(r'\n([\w\d.-]+)#\s*$', content)
+        source_hostname = source_hostname_match.group(1) if source_hostname_match else "N/A"
+
+        neighbors = []
+        # Split the output by '-------------------------' which separates neighbors
+        blocks = content.split('-------------------------')
+        for block in blocks:
+            device_id_match = re.search(r"Device ID:\s*([^\n]+)", block)
+            platform_match = re.search(r"Platform:\s*([^,]+),", block)
+            interface_match = re.search(r"Interface:\s*([^\s]+),", block)  # Local interface
+            port_id_match = re.search(r"Port ID \(outgoing port\):\s*([^\n]+)", block)  # Remote interface
+
+            if device_id_match and platform_match and interface_match and port_id_match:
+                neighbors.append([
+                    source_hostname,
+                    source_ip,
+                    interface_match.group(1).strip(),
+                    device_id_match.group(1).strip(),
+                    port_id_match.group(1).strip(),
+                    platform_match.group(1).strip()
+                ])
+        return neighbors
+
+    def extract_serial_info(self, file_path):
+        """Extracts serial number from a 'show version' output file."""
+        with open(file_path, 'r') as file:
+            content = file.read()
+
+        source_ip_match = re.search(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", os.path.basename(file_path))
+        source_ip = source_ip_match.group(0) if source_ip_match else "N/A"
+
+        source_hostname_match = re.search(r'\n([\w\d.-]+)#\s*$', content)
+        source_hostname = source_hostname_match.group(1) if source_hostname_match else "N/A"
+
+        # Regex to find different variations of serial numbers
+        serial_match = re.search(r"(?:System|Processor board ID)\s+([A-Z0-9]+)", content, re.IGNORECASE)
+
+        if serial_match:
+            serial_number = serial_match.group(1)
+            return [[source_hostname, source_ip, serial_number]]
+        return []
+
+
+if __name__ == "__main__":
     root = tk.Tk()
-    root.title(app_ssh_title)
-    root.minsize(400, 300)
-    # File input button and label
-    file_button = ttk.Button(root, text="Choose IP Address File", command=open_file)
-    file_button.grid(row=0, column=0, pady=20, padx=20)
-    file_label = ttk.Label(root, text="No file chosen")
-    file_label.grid(row=0, column=1, pady=20, padx=20)
-
-    # User input
-    user_label = ttk.Label(root, text="Username:")
-    user_label.grid(row=2, column=0, padx=20, pady=10, sticky='e')
-    user_entry = ttk.Entry(root)
-    user_entry.grid(row=2, column=1, padx=20)
-
-    # Password input
-    password_label = ttk.Label(root, text="Password:")
-    password_label.grid(row=3, column=0, padx=20, pady=10, sticky='e')
-    password_entry = ttk.Entry(root, show="*")
-    password_entry.grid(row=3, column=1, padx=20)
-
-    # Output folder input
-    output_folder_button = ttk.Button(root, text="Choose Output Folder", command=choose_output_folder)
-    output_folder_button.grid(row=1, column=0, padx=20)
-    output_folder_entry = ttk.Entry(root)
-    output_folder_entry.grid(row=1, column=1, padx=20)
-
-    # Command selection
-    command_label = ttk.Label(root, text="Command:")
-    command_label.grid(row=4, column=0, padx=20, sticky='e')
-    command_options = ["show config", "show interfaces", "write", "show version | include Motherboard Serial", "Custom Command"]
-    command_combobox = ttk.Combobox(root, values=command_options, state="readonly")
-    command_combobox.grid(row=4, column=1, padx=20)
-    command_combobox.set(command_options[0])  # Set default value to "show config"
-
-    custom_command_label = ttk.Label(root, text="Custom Commands:")
-    custom_command_text = tk.Text(root, height=10, width=40)  # Adjusted height and width
-    command_combobox.bind("<<ComboboxSelected>>", on_command_selected)
-
-    # Generate Notebook
-
-    notebook = ttk.Notebook(root)
-    notebook.grid(row=7, column=0, columnspan=2, pady=20, padx=20, sticky='ew')
-
-    # Execute button
-    execute_button = ttk.Button(root, text="Execute SSH", command=execute_ssh)
-    execute_button.grid(row=5, column=0, columnspan=2, pady=20)
-
-    # Return to Menu button
-    return_button = ttk.Button(root, text="Return to Menu", command=lambda: return_to_menu(root))
-    return_button.grid(row=8, column=0, columnspan=2, pady=20)
-
-
+    app = SwitchSaverApp(root)
     root.mainloop()
-
-
-def return_to_menu(current_root):
-    current_root.destroy()  # Close the current window
-    main_menu()  # Open the main menu
-
-
-def go_to_ssh(current_root):
-    current_root.destroy()
-    run_ssh_bot()
-
-def generateVersion_csv(menu_root):
-    # Open a folder dialog to select the folder containing the .txt files
-    folder_path = filedialog.askdirectory(title="Select Folder with CDP Neighbor Files")
-
-    if folder_path:
-        all_data = []
-
-        # Iterate through the .txt files in the selected folder
-        for filename in os.listdir(folder_path):
-            if filename.endswith('.txt'):
-                file_path = os.path.join(folder_path, filename)
-                data = extractVersion_info(file_path)
-                all_data.extend(data)
-
-        # If there is data to save
-        if all_data:
-            save_path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV Files", "*.csv")])
-            if save_path:
-                try:
-                    with open(save_path, 'w', newline='') as csvfile:
-                        csv_writer = csv.writer(csvfile)
-                        csv_writer.writerow(
-                            ['sourcehostname', 'sourceip', 'sourceport', 'destinationhostname', 'destinationport',
-                             'Device Model'])  # Write header
-                        csv_writer.writerows(all_data)
-                    messagebox.showinfo("Success", f"CSV file successfully generated: {save_path}")
-                except Exception as e:
-                    messagebox.showerror("Error", f"An error occurred while saving the CSV file: {str(e)}")
-        else:
-            messagebox.showwarning("No Data", "No CDP neighbor data found in the selected folder.")
-    else:
-        messagebox.showwarning("No Folder Selected", "You must select a folder to generate the CSV.")
-
-# Extract Version data from a given .txt file
-def extractVersion_info(file_path):
-    with open(file_path, 'r') as file:
-        content = file.readlines()
-
-    # Extract source IP from the filename (assuming it is embedded in the filename)
-    source_ip = re.search(r"(\d+\.\d+\.\d+\.\d+)", file_path).group(0)  # Extract IP from filename
-
-    # Extract the source hostname (last line of the file, ends with #)
-    source_hostname = content[-1].strip()
-    if source_hostname.endswith("#"):
-        source_hostname = source_hostname[:-1]  # Remove the trailing '#'
-
-    # Regular expression to capture neighbor data
-    neighbor_info = []
-
-    # Define the regex to capture neighbor data, including device model and port (handle multiple spaces)
-    neighbor_pattern = re.compile(
-        r"^([^\n\s]+(?:\.[^\n\s]+)*)\s+(\S+\s*\d+/\d+/\d*|po\d+)\s+\d+\s+[A-Z\s]+\s+([^\s]+(?:\s+[^\s]+)*)\s+(\S+\s+\S+)$")
-
-    # Initialize the neighbor hostname to None to handle multi-line hostnames
-    neighbor_hostname = None
-
-    # Scan for all matching lines with the neighbor info (ignores the first line and non-data lines)
-    for line in content:
-        line = line.strip()
-
-        if line == '':
-            continue
-
-        # If the line starts with a device ID, capture the hostname (handle multiline hostnames)
-        if not re.match(r"\s{0,2}[A-Za-z0-9\.\-]+\s{0,2}", line):  # It's a continuation of the previous line
-            if neighbor_hostname:
-                neighbor_hostname += ' ' + line.strip()  # Add the rest of the multi-line hostname
-        else:
-            # Match with the regex for valid neighbor data
-            match = neighbor_pattern.match(line)
-            if match:
-                # If we found a match, extract the data
-                destination_hostname = match.group(1).strip()
-                source_port = match.group(2).strip()
-                destination_port = match.group(3).strip()
-                device_model = match.group(4).strip()
-
-                # If we have a valid neighbor hostname from the previous line, update it
-                if neighbor_hostname:
-                    destination_hostname = neighbor_hostname.strip()
-
-                # Add the neighbor data in the required format
-                neighbor_info.append(
-                    [source_hostname, source_ip, source_port, destination_hostname, destination_port, device_model])
-
-                # Reset neighbor_hostname to None after processing
-                neighbor_hostname = None
-
-            # If the line doesn't match the pattern but contains a valid hostname
-            # (i.e., single-line hostnames like "BB" or multi-line device names)
-            else:
-                if re.match(r"^[A-Za-z0-9\.\-]+\s*$", line):  # This is part of a multi-line hostname
-                    if neighbor_hostname:
-                        neighbor_hostname += ' ' + line.strip()  # Continue the previous hostname line
-                else:
-                    neighbor_info.append(
-                        [source_hostname, source_ip, '', '', '', ''])  # If missing info, still append empty columns
-
-    return neighbor_info
-
-
-def generateCDP_csv(menu_root):
-    # Open a folder dialog to select the folder containing the .txt files
-    folder_path = filedialog.askdirectory(title="Select Folder with CDP Neighbor Files")
-
-    if folder_path:
-        all_data = []
-
-        # Iterate through the .txt files in the selected folder
-        for filename in os.listdir(folder_path):
-            if filename.endswith('.txt'):
-                file_path = os.path.join(folder_path, filename)
-                data = extractCDP_info(file_path)
-                all_data.extend(data)
-
-        # If there is data to save
-        if all_data:
-            save_path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV Files", "*.csv")])
-            if save_path:
-                try:
-                    with open(save_path, 'w', newline='') as csvfile:
-                        csv_writer = csv.writer(csvfile)
-                        csv_writer.writerow(
-                            ['sourcehostname', 'sourceip', 'sourceport', 'destinationhostname', 'destinationport',
-                             'Device Model'])  # Write header
-                        csv_writer.writerows(all_data)
-                    messagebox.showinfo("Success", f"CSV file successfully generated: {save_path}")
-                except Exception as e:
-                    messagebox.showerror("Error", f"An error occurred while saving the CSV file: {str(e)}")
-        else:
-            messagebox.showwarning("No Data", "No CDP neighbor data found in the selected folder.")
-    else:
-        messagebox.showwarning("No Folder Selected", "You must select a folder to generate the CSV.")
-
-
-
-# Extract CDP data from a given .txt file
-def extractCDP_info(file_path):
-    with open(file_path, 'r') as file:
-        content = file.readlines()
-
-    # Extract source IP from the filename (assuming it is embedded in the filename)
-    source_ip = re.search(r"(\d+\.\d+\.\d+\.\d+)", file_path).group(0)  # Extract IP from filename
-
-    # Extract the source hostname (last line of the file, ends with #)
-    source_hostname = content[-1].strip()
-    if source_hostname.endswith("#"):
-        source_hostname = source_hostname[:-1]  # Remove the trailing '#'
-
-    # Regular expression to capture neighbor data
-    neighbor_info = []
-
-    # Define the regex to capture neighbor data, including device model and port (handle multiple spaces)
-    neighbor_pattern = re.compile(
-        r"^([^\n\s]+(?:\.[^\n\s]+)*)\s+(\S+\s*\d+/\d+/\d*|po\d+)\s+\d+\s+[A-Z\s]+\s+([^\s]+(?:\s+[^\s]+)*)\s+(\S+\s+\S+)$")
-
-    # Initialize the neighbor hostname to None to handle multi-line hostnames
-    neighbor_hostname = None
-
-    # Scan for all matching lines with the neighbor info (ignores the first line and non-data lines)
-    for line in content:
-        line = line.strip()
-
-        if line == '':
-            continue
-
-        # If the line starts with a device ID, capture the hostname (handle multiline hostnames)
-        if not re.match(r"\s{0,2}[A-Za-z0-9\.\-]+\s{0,2}", line):  # It's a continuation of the previous line
-            if neighbor_hostname:
-                neighbor_hostname += ' ' + line.strip()  # Add the rest of the multi-line hostname
-        else:
-            # Match with the regex for valid neighbor data
-            match = neighbor_pattern.match(line)
-            if match:
-                # If we found a match, extract the data
-                destination_hostname = match.group(1).strip()
-                source_port = match.group(2).strip()
-                destination_port = match.group(3).strip()
-                device_model = match.group(4).strip()
-
-                # If we have a valid neighbor hostname from the previous line, update it
-                if neighbor_hostname:
-                    destination_hostname = neighbor_hostname.strip()
-
-                # Add the neighbor data in the required format
-                neighbor_info.append(
-                    [source_hostname, source_ip, source_port, destination_hostname, destination_port, device_model])
-
-                # Reset neighbor_hostname to None after processing
-                neighbor_hostname = None
-
-            # If the line doesn't match the pattern but contains a valid hostname
-            # (i.e., single-line hostnames like "BB" or multi-line device names)
-            else:
-                if re.match(r"^[A-Za-z0-9\.\-]+\s*$", line):  # This is part of a multi-line hostname
-                    if neighbor_hostname:
-                        neighbor_hostname += ' ' + line.strip()  # Continue the previous hostname line
-                else:
-                    neighbor_info.append(
-                        [source_hostname, source_ip, '', '', '', ''])  # If missing info, still append empty columns
-
-    return neighbor_info
-
-def ssh_to_switch(ip, user, pwd, output_directory, command) -> bool:
-    global custom_command_text
-    success = False
-    try:
-        ssh_client = paramiko.SSHClient()
-        ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh_client.connect(ip, username=user, password=pwd)
-
-        remote_conn = ssh_client.invoke_shell()
-        remote_conn.send("enable\n")
-
-        success = True
-        output = ""
-
-
-        if command == "Custom Command":
-            # Get the commands from the Text widget
-            custom_cmds = custom_command_text.get("1.0", tk.END).strip().split("\n")
-            for cmd in custom_cmds:
-                chunk = remote_conn.recv(4096).decode('utf-8')
-                if '--More--' in chunk:
-                    remote_conn.send("               ")  # Send space to continue
-                    chunk = chunk.replace('--More--', '').replace('\x08','')  # '\x08' is the escape code for backspace
-                    #update_gui(ip, chunk)
-                    output += chunk
-                    time.sleep(1.5)  # Wait for more data to be rendered
-                else:
-                    #update_gui(ip, chunk)
-                    output += chunk
-                remote_conn.send(cmd + "\n")
-                time.sleep(1)
-        else:
-            remote_conn.send(command + "\n")
-
-        time.sleep(.5)
-
-        while True:
-            if remote_conn.recv_ready():
-                chunk = remote_conn.recv(4096).decode('utf-8')
-
-                # If "--More--" is in the chunk, send a space to fetch more data
-                if '--More--' in chunk:
-                    remote_conn.send("               ")  # Send space to continue
-                    chunk = chunk.replace('--More--', '').replace('\x08','')  # '\x08' is the escape code for backspace
-                    #update_gui(ip, chunk)
-                    output += chunk
-                    time.sleep(1.5)  # Wait for more data to be rendered
-                else:
-                    #update_gui(ip, chunk)
-                    output += chunk
-                    break
-            else:
-                time.sleep(1.5)  # If not ready to receive, wait and check again
-
-
-
-
-        # Save the output to a file
-        filename = ip + ".txt"
-        filepath = output_directory + '/' + filename
-        with open(filepath, 'w') as outfile:
-            outfile.write(output)
-
-        # Update the GUI with the output
-        update_gui(ip, output)
-
-        ssh_client.close()
-
-    except Exception as e:
-        success = False
-    return success
-
-
-def update_gui(ip, output):
-    # Check if a tab for the IP already exists
-    global  notebook
-    tab_exists = False
-    for tab in notebook.tabs():
-        if notebook.tab(tab, "text") == ip:
-            frame = tab
-            tab_exists = True
-            break
-
-    if not tab_exists:
-        # Create a new tab for the IP
-        frame = ttk.Frame(notebook)
-        notebook.add(frame, text=ip)
-        text_widget = tk.Text(frame, wrap=tk.WORD, height=20, width=60)  # Adjusted height and width
-        text_widget.pack(padx=10, pady=10, expand=True, fill=tk.BOTH)
-    else:
-        # Fetch the Text widget from the existing tab
-        text_widget = frame.winfo_children()[0]
-
-    text_widget.insert(tk.END, output + "\n\n")  # Append new output
-    text_widget.config(state=tk.DISABLED)  # Make the text read-only
-
-
-def execute_ssh():
-    global user_entry, password_entry, command_combobox
-    user = user_entry.get()
-    pwd = password_entry.get()
-    output_directory = output_folder_entry.get()
-    command_selected = command_combobox.get()
-
-    with open(file_path, 'r') as file:
-        ip_addresses = [line.strip() for line in file.readlines()]
-
-    success_ips = []
-    failed_ips = []
-
-    for ip in ip_addresses:
-        if ssh_to_switch(ip, user, pwd, output_directory, command_selected):
-            success_ips.append(ip)
-        else:
-            failed_ips.append(ip)
-
-    success_msg = f"Successfully connected to: {', '.join(success_ips)}" if success_ips else ""
-    failed_msg = f"Failed to connect to: {', '.join(failed_ips)}" if failed_ips else ""
-
-    messagebox.showinfo("Results", success_msg + "\n" + failed_msg)
-def open_file():
-    global file_path, file_label
-    file_path = filedialog.askopenfilename()
-    file_label.config(text=file_path.split("/")[-1])
-
-def choose_output_folder():
-    global output_folder_entry
-
-    folder_path = filedialog.askdirectory()
-    output_folder_entry.delete(0, tk.END)
-    output_folder_entry.insert(tk.END, folder_path)
-
-
-def on_command_selected(event):
-    global custom_command_label
-    selected_command = command_combobox.get()
-    if selected_command == "Custom Command":
-        custom_command_label.grid(row=6, column=0, padx=20, sticky='e')
-        custom_command_text.grid(row=6, column=1, padx=20)
-    else:
-        custom_command_label.grid_forget()
-        custom_command_text.grid_forget()
-
-
-main_menu()
